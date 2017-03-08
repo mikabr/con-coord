@@ -1,0 +1,219 @@
+---
+title: "Pragmatic Coordination on Context"
+author: "Mika Braginsky"
+output:
+  html_notebook:
+    code_folding: none
+    theme: cosmo
+    toc: yes
+    toc_float: yes
+---
+
+<script src="https://use.fontawesome.com/c2cd983497.js"></script>
+<a href="https://github.com/mikabr/con-coord" target="_blank"><i class="fa fa-github fa-2x" aria-hidden="true"></i></a>
+
+```{r setup, message=FALSE, warning=FALSE, echo=FALSE}
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(DirichletReg)
+library(ggplot2)
+library(langcog)
+library(foreach)
+theme_set(theme_mikabr(base_family = "Source Sans Pro"))
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, tidy = FALSE,
+                      cache = TRUE)
+```
+
+$W$ set of all world states, plus `FAIL`
+
+$W$ = {`fork1`, `fork2`, `fork3`, `fork4`, `spoon`}
+
+```{r world}
+world <- c("fork1", "fork2", "fork3", "fork4", "spoon", "FAIL")
+```
+
+
+$M$ set of all messages, including __0__
+
+$M$ = {_fork_, _the fork_, _the spoon_, __0__}
+
+```{r messages}
+messages <- c("fork", "the fork", "the spoon", "0")
+```
+
+
+Lexicon $\mathcal{L}: M \mapsto W$, $\mathcal{L}(0) = W$
+
+```{r lexicon}
+lexicon <- list(
+  "fork" = c("fork1", "fork2", "fork3", "fork4"),
+  "the fork" = c("fork1", "fork2", "fork3", "fork4"),
+  "the spoon" = c("spoon"),
+  "0" = world
+)
+```
+
+
+Context $c: M \mapsto{\mathbb{P}(W_c)}$
+
+- `FAIL` $\in W_c$
+- $W_c -$ {`FAIL`} $\subseteq W$
+- $\forall m \in M, w \in W_c -$ {`FAIL`}, $w \in c(m) \iff w \in \mathcal{L}(m)$
+- $\forall m \in M - \{0\}$, `FAIL` $\in c(m)$ $\iff$ $c(m) =$ {`FAIL`}
+
+```{r contexts}
+context_sets <- list(
+  "fork" = c("fork1"),
+  "forkfork" = c("fork2", "fork3"),
+  "forkspoon" = c("fork4", "spoon")
+)
+
+context <- function(message, context_set) {
+  lexicon_messages <- intersect(lexicon[[message]], context_set)
+  if ((substr(message, 1, 3) == "the" & length(lexicon_messages) > 1) |
+      (message != "0" & !length(lexicon_messages))) {
+    return("FAIL")
+  } else if (message == "0") {
+    return(c(lexicon_messages, "FAIL"))
+  } else {
+    return(lexicon_messages)
+  }
+}
+
+contexts <- context_sets %>%
+  map(function(context_set) {
+    messages %>%
+      map(function(message) context(message, context_set)) %>%
+      set_names(messages)
+  })
+```
+
+```{r}
+lambda <- 1
+
+state_prior <- context_sets %>%
+  map(function(context_set) {
+    uniform <- (1 - 0.01) / length(context_set)
+    c(rep(uniform, length(context_set)), 0.01) %>%
+      set_names(c(context_set, "FAIL"))
+  })
+
+prior <- function(context, state) {
+  context_state_prior <- state_prior[[context]]
+  if (state %in% names(context_state_prior)) {
+    context_state_prior[[state]]
+  } else {
+    0
+  }
+}
+
+message_cost <- messages %>%
+  strsplit(" ") %>%
+  map_dbl(length) %>%
+  set_names(messages)
+message_cost[["0"]] <- 5
+```
+
+Literal listener:
+
+$$ l_0(w \: | \: m,c,\mathcal{L}) \propto \frac{\mathbb{I}(w \in c(m))}{| \: c(m) \:|} \: P_c(w)$$
+
+```{r}
+# literal listener's probability of world state given message, context, lexicon
+listener_literal <- function(message, context, lexicon) {
+  function(state) {
+    message_context <- contexts[[context]][[message]]
+    p_state <- function(s) s %in% message_context / length(message_context) *
+      prior(context, s)
+    p_state(state) / sum(map_dbl(world, p_state))
+  }
+}
+```
+
+Pragmatic speaker:
+
+$$ s_1(m \: | \: w,c,\mathcal{L}) \propto \text{exp} (\lambda (\log{l_0(w \: | \: m,c,\mathcal{L}) - \text{cost}(m)})) $$
+
+```{r}
+# pragmatic speaker's posterior of message given world state, context, lexicon
+speaker <- function(state, context, lexicon) {
+  function(message) {
+    p_message <- function(m) {
+      exp(lambda * (log(listener_literal(m, context, lexicon)(state)) -
+                      message_cost[[m]]))
+    }
+    p_message(message) / sum(map_dbl(messages, p_message))
+  }
+}
+```
+
+$\mathcal{C}$ set of all contexts, $P$ prior over $\mathcal{C}$
+
+```{r}
+num_contexts <- length(contexts)
+context_prior <- rep(1 / num_contexts, num_contexts) %>%
+  set_names(names(contexts))
+```
+
+Pragmatic context-uncertain listener:
+
+$$ L(w,c \: | \: m,\mathcal{L}) \propto P(c) \: s_1(m \:| \: w,c,\mathcal{L}) \: P_c(w) $$
+$$ L(w \: | \: m,\mathcal{L}) = \sum_{c \in \mathcal{C}} L(w,c \: | \: m,\mathcal{L}) $$
+$$ L(c \: | \: m,\mathcal{L}) = \sum_{w \in (\cup_{c \in \mathcal{C}} W_c)} L(w,c \: | \: m,\mathcal{L}) $$
+
+
+```{r}
+listener <- function(message, lexicon) {
+  function(state, context) {
+    context_prior[[context]] * speaker(state, context, lexicon)(message) *
+      prior(context, state)
+  }
+}
+```
+
+```{r}
+context_combos <- list(
+  "FvFF" = c("fork", "forkfork"),
+  "FFvFS" = c("forkfork", "forkspoon"),
+  "FvFS" = c("fork", "forkspoon"),
+  "FvFFvFS" = c("fork", "forkfork", "forkspoon")
+)
+
+combo_posteriors <- context_combos %>%
+  map(function(combo) {
+    expand.grid(message = messages,
+                state = world,
+                context = combo,
+                stringsAsFactors = FALSE) %>%
+      mutate(p = pmap_dbl(list(message, state, context),
+                          function(m, s, c) listener(m, lexicon)(s, c))) %>%
+      filter(!is.nan(p)) %>%
+      group_by(message) %>%
+      mutate(p = p / sum(p))
+  }) %>%
+  set_names(names(context_combos))
+
+combo_context_posteriors <- combo_posteriors %>%
+  map(function(combo_posterior) {
+    combo_posterior %>%
+      group_by(message, context) %>%
+      summarise(p = sum(p))
+  })
+
+combo_state_posteriors <- combo_posteriors %>%
+  map(function(combo_posterior) {
+    combo_posterior %>%
+      group_by(message, state) %>%
+      summarise(p = sum(p))
+  })
+```
+
+```{r}
+combo_context_posteriors %>%
+  map2_df(names(combo_context_posteriors), ~.x %>% mutate(combo = .y)) %>%
+  ggplot(aes(x = context, y = p)) +
+    facet_grid(message ~ combo) +
+    geom_bar(stat = "identity")
+```
+
